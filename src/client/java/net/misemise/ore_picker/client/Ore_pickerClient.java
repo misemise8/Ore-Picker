@@ -6,35 +6,39 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.misemise.ore_picker.config.ConfigManager;
-import net.misemise.ore_picker.network.HoldC2SPayload;
+import net.misemise.ore_picker.network.HoldC2SPayload; // NOTE: this class is now obsolete; keep import removed if you deleted it
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
+import net.minecraft.network.PacketByteBuf;
+import io.netty.buffer.Unpooled;
 import org.lwjgl.glfw.GLFW;
-import org.lwjgl.system.CallbackI;
-
-import org.spongepowered.include.org.checkerframework.checker.nullness.qual.Nullable; // ignore if not present
 
 /**
- * Client initializer: registers keybinding, sends C2S payloads, and renders simple HUD above hotbar.
- *
- * Mode behavior:
- *  - "hold": sends pressed state on change (true/false)
- *  - "toggle": sends only pressed=true events; server will toggle on received pressed=true
+ * Client initializer: keybind, HUD, and receiver for destroyed count using PacketByteBuf.
  */
 public class Ore_pickerClient implements ClientModInitializer {
     public static final Identifier HOLD_ID = Identifier.of("orepicker", "hold_vein");
+    public static final Identifier DESTROYED_ID = Identifier.of("orepicker", "destroyed_count");
 
     private KeyBinding holdKey;
     private boolean lastPressed = false;
-    private boolean clientToggleState = false; // used when mode == "toggle" for local HUD
+    private boolean clientToggleState = false;
+
+    // HUD state
+    private static volatile long lastHudShownMs = 0L;
+    private static volatile boolean hudVisible = false;
+    private static volatile int lastDestroyedCount = 0;
+
+    private static final long SHOW_DURATION_MS = 2000L; // 2 seconds shown
+    private static final long FADE_DURATION_MS = 500L;  // 0.5 second fade
 
     @Override
     public void onInitializeClient() {
-        // load client-side config copy
         try { ConfigManager.load(); } catch (Throwable ignored) {}
 
         holdKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
@@ -44,7 +48,22 @@ public class Ore_pickerClient implements ClientModInitializer {
                 "category.orepicker"
         ));
 
-        // tick: watch key changes and send payload
+        // S2C receiver: destroyed count
+        try {
+            ClientPlayNetworking.registerGlobalReceiver(DESTROYED_ID, (client, handler, buf, responseSender) -> {
+                try {
+                    int cnt = buf.readInt();
+                    lastDestroyedCount = cnt;
+                    hudShowNow();
+                } catch (Throwable t) {
+                    t.printStackTrace();
+                }
+            });
+        } catch (Throwable t) {
+            t.printStackTrace();
+        }
+
+        // tick: watch key changes and send PacketByteBuf to server
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             try {
                 if (holdKey == null || MinecraftClient.getInstance().player == null) return;
@@ -52,16 +71,15 @@ public class Ore_pickerClient implements ClientModInitializer {
                 String mode = ConfigManager.INSTANCE.mode == null ? "hold" : ConfigManager.INSTANCE.mode;
 
                 if ("toggle".equalsIgnoreCase(mode)) {
-                    // on pressed=true edge, flip client local state and send pressed=true to server to indicate toggle
                     if (pressed && !lastPressed) {
                         clientToggleState = !clientToggleState;
                         sendTogglePacket();
+                        hudShowNow();
                     }
-                    // don't send on release
                 } else {
-                    // hold mode: send both changes
                     if (pressed != lastPressed) {
                         sendHoldPacket(pressed);
+                        hudShowNow();
                     }
                 }
                 lastPressed = pressed;
@@ -70,47 +88,61 @@ public class Ore_pickerClient implements ClientModInitializer {
             }
         });
 
-        // HUD rendering: draw small indicator above hotbar
-        try {
-            HudRenderCallback.EVENT.register((DrawContext matrices, float tickDelta) -> {
-                try {
-                    MinecraftClient mc = MinecraftClient.getInstance();
-                    if (mc == null || mc.player == null) return;
+        // HUD rendering
+        HudRenderCallback.EVENT.register((DrawContext drawContext, RenderTickCounter tickCounter) -> {
+            try {
+                MinecraftClient mc = MinecraftClient.getInstance();
+                if (mc == null || mc.player == null) return;
 
-                    int scaledW = mc.getWindow().getScaledWidth();
-                    int scaledH = mc.getWindow().getScaledHeight();
-                    // center horizontally, slightly above hotbar
-                    String mode = ConfigManager.INSTANCE.mode == null ? "hold" : ConfigManager.INSTANCE.mode;
-                    boolean active;
-                    if ("toggle".equalsIgnoreCase(mode)) active = clientToggleState;
-                    else active = (holdKey != null && holdKey.isPressed());
+                long now = System.currentTimeMillis();
+                if (!hudVisible) return;
 
-                    String text = "OrePicker: " + (active ? "ON" : "OFF");
-                    int color = active ? 0xFF66FF66 : 0xFFCCCCCC;
-
-                    // compute text width using TextRenderer (take Text.of for safety)
-                    Text t = Text.of(text);
-                    int textWidth = mc.textRenderer.getWidth(t);
-
-                    int x = scaledW / 2 - textWidth / 2;
-                    int y = scaledH - 40; // adjust if needed
-
-                    // Use DrawContext.drawTextWithShadow to render text using the client's TextRenderer
-                    matrices.drawTextWithShadow(mc.textRenderer, t, x, y, color);
-                } catch (Throwable t) {
-                    t.printStackTrace();
+                long elapsedSinceShow = now - lastHudShownMs;
+                float alpha = 1.0f;
+                if (elapsedSinceShow <= SHOW_DURATION_MS) {
+                    alpha = 1.0f;
+                } else if (elapsedSinceShow <= SHOW_DURATION_MS + FADE_DURATION_MS) {
+                    float t = (float)(elapsedSinceShow - SHOW_DURATION_MS) / (float)FADE_DURATION_MS;
+                    alpha = 1.0f - t;
+                } else {
+                    hudVisible = false;
+                    return;
                 }
-            });
-        } catch (Throwable t) {
-            // If HudRenderCallback class/signature differs, fallback to no HUD (still OK)
-            t.printStackTrace();
-        }
+
+                int scaledW = mc.getWindow().getScaledWidth();
+                int scaledH = mc.getWindow().getScaledHeight();
+
+                String mode = ConfigManager.INSTANCE.mode == null ? "hold" : ConfigManager.INSTANCE.mode;
+                boolean active = "toggle".equalsIgnoreCase(mode) ? clientToggleState : (holdKey != null && holdKey.isPressed());
+
+                String text = "OrePicker: " + (active ? "ON" : "OFF") + " (" + lastDestroyedCount + ")";
+                int baseColor = active ? 0x66FF66 : 0xCCCCCC; // base rgb
+                int alphaByte = Math.max(0, Math.min(255, (int)(alpha * 255f)));
+                int color = (alphaByte << 24) | (baseColor & 0x00FFFFFF);
+
+                Text t = Text.of(text);
+                int width = mc.textRenderer.getWidth(t);
+
+                int x = scaledW / 2 - width / 2;
+                int y = scaledH - 70; // moved upward to avoid hotbar overlay
+
+                drawContext.drawTextWithShadow(mc.textRenderer, t, x, y, color);
+            } catch (Throwable t) {
+                t.printStackTrace();
+            }
+        });
+    }
+
+    private static void hudShowNow() {
+        hudVisible = true;
+        lastHudShownMs = System.currentTimeMillis();
     }
 
     private void sendHoldPacket(boolean pressed) {
         try {
-            HoldC2SPayload payload = new HoldC2SPayload(pressed);
-            ClientPlayNetworking.send(payload);
+            PacketByteBuf buf = new PacketByteBuf(Unpooled.buffer());
+            buf.writeBoolean(pressed);
+            ClientPlayNetworking.send(HOLD_ID, buf);
             MinecraftClient.getInstance().player.sendMessage(Text.of("Client: send hold=" + pressed + " -> SENT"), false);
         } catch (Throwable t) {
             t.printStackTrace();
@@ -120,8 +152,9 @@ public class Ore_pickerClient implements ClientModInitializer {
 
     private void sendTogglePacket() {
         try {
-            HoldC2SPayload payload = new HoldC2SPayload(true); // server toggles only on pressed=true
-            ClientPlayNetworking.send(payload);
+            PacketByteBuf buf = new PacketByteBuf(Unpooled.buffer());
+            buf.writeBoolean(true); // only pressed=true for toggle
+            ClientPlayNetworking.send(HOLD_ID, buf);
             MinecraftClient.getInstance().player.sendMessage(Text.of("Client: send toggle -> SENT"), false);
         } catch (Throwable t) {
             t.printStackTrace();

@@ -7,19 +7,17 @@ import net.minecraft.network.codec.PacketCodecs;
 import net.minecraft.network.packet.CustomPayload;
 
 /**
- * Client -> Server payload for hold state.
- * Uses PacketCodecs.BOOLEAN (some mappings may need PacketCodecs.BOOL — もしコンパイルエラーが出たら置き換えてください)
+ * Server -> Client payload: sends an int "destroyedCount"
  */
-public record HoldC2SPayload(boolean pressed) implements CustomPayload {
-    public static final Identifier ID = Identifier.of("orepicker", "hold_vein");
-    public static final CustomPayload.Id<HoldC2SPayload> TYPE = new CustomPayload.Id<>(ID);
+public record DestroyedCountS2CPayload(int count) implements CustomPayload {
+    public static final Identifier ID = Identifier.of("orepicker", "destroyed_count");
+    public static final CustomPayload.Id<DestroyedCountS2CPayload> TYPE = new CustomPayload.Id<>(ID);
 
-    public static final PacketCodec<PacketByteBuf, HoldC2SPayload> CODEC =
+    public static final PacketCodec<PacketByteBuf, DestroyedCountS2CPayload> CODEC =
             PacketCodec.tuple(
-                    // If BOOLEAN is not present in your mappings, change to PacketCodecs.BOOL
-                    PacketCodecs.BOOLEAN,
-                    HoldC2SPayload::pressed,
-                    HoldC2SPayload::new
+                    PacketCodecs.INT,
+                    DestroyedCountS2CPayload::count,
+                    DestroyedCountS2CPayload::new
             );
 
     @Override
