@@ -1,12 +1,12 @@
-package net.misemise.ore_picker;
+package net.misemise.ore_picker; // あなたのパッケージに合わせてください
 
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.minecraft.block.Block;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
@@ -14,89 +14,96 @@ import net.minecraft.world.World;
 import java.util.*;
 
 /**
- * OrePicker 用 MineAllHandler
- * - public static breakConnectedOres(ServerWorld, BlockPos, ServerPlayerEntity) を提供
- * - 既存の onBlockBreak(…) も残してある（BEFORE イベントで使えます）
- * - AutoCollectHandler.collectDrops(...) を呼び出してドロップ回収＋XP付与を行います
+ * 一括破壊ハンドラ（PlayerBlockBreakEvents.BEFORE 用）
+ *
+ * 注意：
+ * - この before ハンドラはサーバ側でのみ呼ばれます（Fabric が保証）
+ * - 返り値: true を返すと次のリスナへ進み、最終的に破壊が続行されます。
+ *   false を返すと破壊がキャンセルされます（ハンドラ内でブロックを直接消す場合は false を返す）。
  */
 public class MineAllHandler {
 
+    // 対象ブロック群（必要なら追加）
     private static final Set<Block> MINABLE_BLOCKS = Set.of(
             Blocks.COAL_ORE,
             Blocks.IRON_ORE,
             Blocks.GOLD_ORE,
             Blocks.DIAMOND_ORE,
-            Blocks.COPPER_ORE,
             Blocks.LAPIS_ORE,
-            Blocks.REDSTONE_ORE,
-            Blocks.EMERALD_ORE
+            Blocks.NETHER_QUARTZ_ORE
     );
 
-    // 保護用：一括で壊す最大ブロック数
-    private static final int MAX_BLOCKS = 256;
-
     /**
-     * あなたが以前使っていた BEFORE イベント向けメソッド（元コード互換）
-     * true を返すと通常の破壊処理を続行、false を返すとキャンセル
+     * PlayerBlockBreakEvents.Before の関数シグネチャに合わせた公開メソッド。
+     * Fabric API のインターフェイスは
+     *   boolean beforeBlockBreak(World world, PlayerEntity player, BlockPos pos, BlockState state, BlockEntity blockEntity)
+     * なので、そのまま渡せます（method reference）。
      */
-    public static boolean onBlockBreak(World world, PlayerEntity player, BlockPos pos, BlockState state, BlockEntity _blockEntity) {
-        if (!(world instanceof ServerWorld serverWorld) || !(player instanceof ServerPlayerEntity serverPlayer)) {
-            return true; // クライアント側または非サーバプレイヤーなら通常処理
+    public static boolean onBlockBreak(World world, PlayerEntity player, BlockPos pos, BlockState state, BlockEntity blockEntity) {
+        // サーバ側だけ処理（Fabric はサーバのみ呼ぶはずだが二重チェック）
+        if (world.isClient) return true;
+
+        Block broken = state.getBlock();
+
+        // 1) 対象ブロックかチェック
+        if (!MINABLE_BLOCKS.contains(broken)) {
+            return true; // 対象外は通常の処理に渡す
         }
 
-        Block brokenBlock = state.getBlock();
-        if (MINABLE_BLOCKS.contains(brokenBlock)) {
-            // プレイヤー通知（任意）
-            try {
-                serverPlayer.sendMessage(Text.of("鉱石を壊した！: " + brokenBlock.getName().getString()), false);
-            } catch (Throwable ignored) {}
-
-            // 実際の一括破壊処理（public メソッドを使う）
-            breakConnectedOres(serverWorld, pos, serverPlayer);
-            return false; // 元の破壊処理はキャンセル（こちらで処理済み）
+        // 2) プレイヤーがサーバプレイヤーかどうか（安全のため）
+        if (!(player instanceof ServerPlayerEntity serverPlayer)) {
+            return true;
         }
 
-        return true;
+        // 3) キーバインドでホールド中か確認（KeybindHandlerはサーバ側で保持される）
+        boolean holding = KeybindHandler.isHolding(serverPlayer.getUuid());
+
+        // 任意：スニーク必須にするなら下のコメントを外す（今はホールド必須のみ）
+        // boolean sneak = serverPlayer.isSneaking();
+        // if (!(holding && sneak)) return true;
+
+        if (!holding) {
+            // ホールドしていなければ通常処理へ
+            return true;
+        }
+
+        // 4) デバッグメッセージ（クライアントにも見せる）
+        try {
+            serverPlayer.sendMessage(Text.of("鉱石一括破壊を開始します: " + broken.getName().getString()), false);
+        } catch (Throwable ignored) {}
+
+        // 5) 一括破壊（BFSで同種の鉱石を辿る）
+        mineAll((World) world, serverPlayer, pos, broken);
+
+        // 6) 元のブロック破壊はキャンセル（自分で AIR にするため）
+        return false;
     }
 
-    /**
-     * 既存コードが呼んでいたメソッド（コンパイルエラーの対象）
-     * ServerWorld / ServerPlayerEntity を受け取る形に合わせています。
-     */
-    public static void breakConnectedOres(ServerWorld world, BlockPos startPos, ServerPlayerEntity player) {
-        BlockState startState = world.getBlockState(startPos);
-        Block startBlock = startState.getBlock();
-
-        if (!MINABLE_BLOCKS.contains(startBlock)) return;
-
-        Queue<BlockPos> queue = new ArrayDeque<>();
+    private static void mineAll(World world, PlayerEntity player, BlockPos origin, Block targetBlock) {
+        Queue<BlockPos> q = new ArrayDeque<>();
         Set<BlockPos> visited = new HashSet<>();
-        queue.add(startPos);
-        visited.add(startPos);
+        q.add(origin);
 
-        int brokenCount = 0;
+        while (!q.isEmpty()) {
+            BlockPos p = q.poll();
+            if (visited.contains(p)) continue;
+            visited.add(p);
 
-        while (!queue.isEmpty() && brokenCount < MAX_BLOCKS) {
-            BlockPos pos = queue.poll();
-            BlockState state = world.getBlockState(pos);
-
-            if (state.getBlock() == startBlock) {
-                // ドロップ回収 + XP 付与 + ブロック削除を AutoCollectHandler に委譲
+            BlockState s = world.getBlockState(p);
+            if (s.getBlock() == targetBlock) {
+                // AutoCollectHandler に任せてドロップ回収・XP付与・ブロック消去を行う
                 try {
-                    AutoCollectHandler.collectDrops(world, player, pos, state);
-                } catch (Throwable ignored) {}
+                    AutoCollectHandler.collectDrops(world, player, p, s);
+                } catch (Throwable t) {
+                    t.printStackTrace();
+                }
 
-                brokenCount++;
-
-                // 近傍 3x3x3 を探査（既存コードの挙動に合わせる）
+                // 近傍9x9x9（3x3x3の隣接）を探索
                 for (int dx = -1; dx <= 1; dx++) {
                     for (int dy = -1; dy <= 1; dy++) {
                         for (int dz = -1; dz <= 1; dz++) {
-                            BlockPos neighbor = pos.add(dx, dy, dz);
-                            if (!visited.contains(neighbor)) {
-                                visited.add(neighbor);
-                                queue.add(neighbor);
-                            }
+                            BlockPos np = p.add(dx, dy, dz);
+                            if (!visited.contains(np)) q.add(np);
                         }
                     }
                 }

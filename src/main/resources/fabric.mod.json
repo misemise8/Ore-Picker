@@ -13,12 +13,8 @@
     "fabric-datagen": [
       "net.misemise.ore_picker.client.Ore_pickerDataGenerator"
     ],
-    "client": [
-      "net.misemise.ore_picker.client.Ore_pickerClient"
-    ],
-    "main": [
-      "net.misemise.ore_picker.Ore_picker"
-    ]
+    "client": ["net.misemise.ore_picker.client.Ore_pickerClient"],
+    "main": ["net.misemise.ore_picker.Ore_picker"]
   },
   "mixins": [
     "ore_picker.mixins.json",
