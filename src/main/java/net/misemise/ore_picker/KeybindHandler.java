@@ -6,14 +6,13 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Server-side key state holder.
- * - setHolding(...) を Ore_picker の receiver から呼ぶ。
- * - isHolding(...) を MineAllHandler 等で参照する。
+ * - setHolding(UUID, boolean)
+ * - toggleHolding(UUID)
+ * - isHolding(UUID)
  */
 public class KeybindHandler {
     private static final Map<UUID, Boolean> HOLDING = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> LAST_PRESSED_MS = new ConcurrentHashMap<>();
-
-    // ミリ秒ウィンドウ — 必要なら変更
     private static final long SHORT_HOLD_WINDOW = 700L;
 
     public static void setHolding(UUID id, boolean holding) {
@@ -26,11 +25,17 @@ public class KeybindHandler {
         }
     }
 
-    /**
-     * ホールド判定。
-     * 1) 明示的に HOLDING に true があれば true
-     * 2) ない場合でも最後に押してから SHORT_HOLD_WINDOW ミリ秒以内なら true（遅延吸収）
-     */
+    public static void toggleHolding(UUID id) {
+        boolean was = HOLDING.getOrDefault(id, false);
+        if (was) {
+            HOLDING.remove(id);
+            LAST_PRESSED_MS.remove(id);
+        } else {
+            HOLDING.put(id, true);
+            LAST_PRESSED_MS.put(id, System.currentTimeMillis());
+        }
+    }
+
     public static boolean isHolding(UUID playerId) {
         Boolean b = HOLDING.get(playerId);
         if (b != null && b) return true;
