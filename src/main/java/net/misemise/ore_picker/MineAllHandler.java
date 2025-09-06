@@ -1,6 +1,5 @@
-package net.misemise.ore_picker; // あなたのパッケージに合わせてください
+package net.misemise.ore_picker;
 
-import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.minecraft.block.Block;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.BlockState;
@@ -10,20 +9,15 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
-
 import java.util.*;
 
 /**
- * 一括破壊ハンドラ（PlayerBlockBreakEvents.BEFORE 用）
- *
- * 注意：
- * - この before ハンドラはサーバ側でのみ呼ばれます（Fabric が保証）
- * - 返り値: true を返すと次のリスナへ進み、最終的に破壊が続行されます。
- *   false を返すと破壊がキャンセルされます（ハンドラ内でブロックを直接消す場合は false を返す）。
+ * Verbose debug 用 MineAllHandler
+ * - PlayerBlockBreakEvents.BEFORE から呼ばれるように想定
+ * - ログを多めに出して「なぜ一括破壊が起きないか？」を特定する
  */
 public class MineAllHandler {
 
-    // 対象ブロック群（必要なら追加）
     private static final Set<Block> MINABLE_BLOCKS = Set.of(
             Blocks.COAL_ORE,
             Blocks.IRON_ORE,
@@ -33,80 +27,89 @@ public class MineAllHandler {
             Blocks.NETHER_QUARTZ_ORE
     );
 
-    /**
-     * PlayerBlockBreakEvents.Before の関数シグネチャに合わせた公開メソッド。
-     * Fabric API のインターフェイスは
-     *   boolean beforeBlockBreak(World world, PlayerEntity player, BlockPos pos, BlockState state, BlockEntity blockEntity)
-     * なので、そのまま渡せます（method reference）。
-     */
+    // BEFOREイベント用。Fabric の PlayerBlockBreakEvents.BEFORE に渡すシグネチャ
     public static boolean onBlockBreak(World world, PlayerEntity player, BlockPos pos, BlockState state, BlockEntity blockEntity) {
-        // サーバ側だけ処理（Fabric はサーバのみ呼ぶはずだが二重チェック）
-        if (world.isClient) return true;
-
-        Block broken = state.getBlock();
-
-        // 1) 対象ブロックかチェック
-        if (!MINABLE_BLOCKS.contains(broken)) {
-            return true; // 対象外は通常の処理に渡す
-        }
-
-        // 2) プレイヤーがサーバプレイヤーかどうか（安全のため）
-        if (!(player instanceof ServerPlayerEntity serverPlayer)) {
-            return true;
-        }
-
-        // 3) キーバインドでホールド中か確認（KeybindHandlerはサーバ側で保持される）
-        boolean holding = KeybindHandler.isHolding(serverPlayer.getUuid());
-
-        // 任意：スニーク必須にするなら下のコメントを外す（今はホールド必須のみ）
-        // boolean sneak = serverPlayer.isSneaking();
-        // if (!(holding && sneak)) return true;
-
-        if (!holding) {
-            // ホールドしていなければ通常処理へ
-            return true;
-        }
-
-        // 4) デバッグメッセージ（クライアントにも見せる）
         try {
-            serverPlayer.sendMessage(Text.of("鉱石一括破壊を開始します: " + broken.getName().getString()), false);
-        } catch (Throwable ignored) {}
+            System.out.println("[OrePicker] onBlockBreak invoked: world.isClient=" + world.isClient + ", player=" + (player == null ? "null" : player.getName().getString())
+                    + ", pos=" + pos + ", block=" + state.getBlock().getName().getString());
 
-        // 5) 一括破壊（BFSで同種の鉱石を辿る）
-        mineAll((World) world, serverPlayer, pos, broken);
+            // 1) 必ずサーバ側で処理（安全のため）
+            if (world.isClient) {
+                System.out.println("[OrePicker] onBlockBreak: called on client side — ignoring");
+                return true;
+            }
 
-        // 6) 元のブロック破壊はキャンセル（自分で AIR にするため）
-        return false;
+            if (!(player instanceof ServerPlayerEntity serverPlayer)) {
+                System.out.println("[OrePicker] onBlockBreak: player is not ServerPlayerEntity — ignoring");
+                return true;
+            }
+
+            Block broken = state.getBlock();
+
+            // 2) 対象ブロックか
+            boolean isTarget = MINABLE_BLOCKS.contains(broken);
+            System.out.println("[OrePicker] Block check: " + broken.getName().getString() + " isTarget=" + isTarget);
+            if (!isTarget) {
+                return true;
+            }
+
+            // 3) KeybindHandler に問い合わせる
+            boolean holding = KeybindHandler.isHolding(serverPlayer.getUuid());
+            System.out.println("[OrePicker] KeybindHandler.isHolding for " + serverPlayer.getUuid() + " => " + holding);
+
+            // If you previously used sneak+hold, and want to require sneak, uncomment next lines:
+            // boolean sneak = serverPlayer.isSneaking();
+            // System.out.println("[OrePicker] player.isSneaking=" + sneak);
+            // if (!(holding && sneak)) return true;
+
+            if (!holding) {
+                System.out.println("[OrePicker] Not holding -> normal break");
+                return true;
+            }
+
+            // 4) Start vein mine (BFS)
+            try {
+                serverPlayer.sendMessage(Text.of("鉱石一括破壊を開始します: " + broken.getName().getString()), false);
+            } catch (Throwable ignore) {}
+
+            System.out.println("[OrePicker] Starting mineAll from " + pos + " target=" + broken.getName().getString());
+            mineAll(world, serverPlayer, pos, broken);
+            System.out.println("[OrePicker] mineAll finished. returning false to cancel default break");
+
+            // We handled block destruction ourselves (AutoCollectHandler removes blocks), so cancel the normal break
+            return false;
+        } catch (Throwable t) {
+            t.printStackTrace();
+            // 何か例外が起きたら安全のため通常処理へ
+            return true;
+        }
     }
 
     private static void mineAll(World world, PlayerEntity player, BlockPos origin, Block targetBlock) {
-        Queue<BlockPos> q = new ArrayDeque<>();
+        Queue<BlockPos> toCheck = new ArrayDeque<>();
         Set<BlockPos> visited = new HashSet<>();
-        q.add(origin);
+        toCheck.add(origin);
 
-        while (!q.isEmpty()) {
-            BlockPos p = q.poll();
-            if (visited.contains(p)) continue;
-            visited.add(p);
+        while (!toCheck.isEmpty()) {
+            BlockPos pos = toCheck.poll();
+            if (visited.contains(pos)) continue;
+            visited.add(pos);
 
-            BlockState s = world.getBlockState(p);
-            if (s.getBlock() == targetBlock) {
-                // AutoCollectHandler に任せてドロップ回収・XP付与・ブロック消去を行う
+            BlockState state = world.getBlockState(pos);
+            if (state.getBlock() == targetBlock) {
+                System.out.println("[OrePicker] Mining block at " + pos);
+                // AutoCollectHandler は既に提供済みのものを使う（ドロップ回収＋XP＋ブロック除去）
                 try {
-                    AutoCollectHandler.collectDrops(world, player, p, s);
+                    AutoCollectHandler.collectDrops(world, player, pos, state);
                 } catch (Throwable t) {
                     t.printStackTrace();
                 }
 
-                // 近傍9x9x9（3x3x3の隣接）を探索
-                for (int dx = -1; dx <= 1; dx++) {
-                    for (int dy = -1; dy <= 1; dy++) {
-                        for (int dz = -1; dz <= 1; dz++) {
-                            BlockPos np = p.add(dx, dy, dz);
-                            if (!visited.contains(np)) q.add(np);
-                        }
-                    }
-                }
+                // 近傍を追加
+                for (int dx = -1; dx <= 1; dx++)
+                    for (int dy = -1; dy <= 1; dy++)
+                        for (int dz = -1; dz <= 1; dz++)
+                            toCheck.add(pos.add(dx, dy, dz));
             }
         }
     }
