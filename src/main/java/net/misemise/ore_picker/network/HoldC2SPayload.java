@@ -1,27 +1,38 @@
 package net.misemise.ore_picker.network;
 
-import net.minecraft.util.Identifier;
+import io.netty.buffer.Unpooled;
 import net.minecraft.network.PacketByteBuf;
 import net.minecraft.network.codec.PacketCodec;
-import net.minecraft.network.codec.PacketCodecs;
 import net.minecraft.network.packet.CustomPayload;
+import net.minecraft.util.Identifier;
 
 /**
- * Server -> Client payload: sends an int "destroyedCount"
+ * Client -> Server payload carrying a single boolean "hold".
  */
-public record DestroyedCountS2CPayload(int count) implements CustomPayload {
-    public static final Identifier ID = Identifier.of("orepicker", "destroyed_count");
-    public static final CustomPayload.Id<DestroyedCountS2CPayload> TYPE = new CustomPayload.Id<>(ID);
+public record HoldC2SPayload(boolean hold) implements CustomPayload {
+    public static final Identifier ID = Identifier.of("orepicker", "hold_vein");
+    public static final CustomPayload.Id<HoldC2SPayload> TYPE = new CustomPayload.Id<>(ID);
 
-    public static final PacketCodec<PacketByteBuf, DestroyedCountS2CPayload> CODEC =
-            PacketCodec.tuple(
-                    PacketCodecs.INT,
-                    DestroyedCountS2CPayload::count,
-                    DestroyedCountS2CPayload::new
+    // Simple codec: writeBoolean / readBoolean
+    public static final PacketCodec<PacketByteBuf, HoldC2SPayload> CODEC =
+            PacketCodec.of(
+                    (payload, buf) -> buf.writeBoolean(payload.hold()),
+                    buf -> new HoldC2SPayload(buf.readBoolean())
             );
 
     @Override
     public CustomPayload.Id<? extends CustomPayload> getId() {
         return TYPE;
+    }
+
+    // helper to build PacketByteBuf quickly
+    public static PacketByteBuf toBuf(boolean v) {
+        PacketByteBuf buf = new PacketByteBuf(Unpooled.buffer());
+        buf.writeBoolean(v);
+        return buf;
+    }
+
+    public static HoldC2SPayload readFromBuf(PacketByteBuf buf) {
+        return new HoldC2SPayload(buf.readBoolean());
     }
 }

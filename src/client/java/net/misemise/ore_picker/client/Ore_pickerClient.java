@@ -1,46 +1,41 @@
 package net.misemise.ore_picker.client;
 
-import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
-import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
-import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
-import net.misemise.ore_picker.config.ConfigManager;
-import net.misemise.ore_picker.network.HoldC2SPayload; // NOTE: this class is now obsolete; keep import removed if you deleted it
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.gui.DrawContext;
-import net.minecraft.client.option.KeyBinding;
-import net.minecraft.client.render.RenderTickCounter;
-import net.minecraft.client.util.InputUtil;
-import net.minecraft.text.Text;
-import net.minecraft.util.Identifier;
-import net.minecraft.network.PacketByteBuf;
 import io.netty.buffer.Unpooled;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import net.minecraft.network.PacketByteBuf;
+import net.minecraft.text.Text;
 import org.lwjgl.glfw.GLFW;
+import net.misemise.ore_picker.network.HoldC2SPayload;
+import net.misemise.ore_picker.network.DestroyedCountS2CPayload;
+
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 
 /**
- * Client initializer: keybind, HUD, and receiver for destroyed count using PacketByteBuf.
+ * Client initializer — ラムダ/ローカルキャプチャを避けた実装（完全版）
+ *
+ * - 匿名クラス / static 内部クラスのみを使う（ラムダ/ローカルキャプチャ問題回避）
+ * - ClientTickEvents, ClientPlayNetworking 周りは reflection で互換性を確保
+ * - HUD とサーバ送受信は既存のクラスに委譲
  */
 public class Ore_pickerClient implements ClientModInitializer {
-    public static final Identifier HOLD_ID = Identifier.of("orepicker", "hold_vein");
-    public static final Identifier DESTROYED_ID = Identifier.of("orepicker", "destroyed_count");
-
     private KeyBinding holdKey;
     private boolean lastPressed = false;
-    private boolean clientToggleState = false;
-
-    // HUD state
-    private static volatile long lastHudShownMs = 0L;
-    private static volatile boolean hudVisible = false;
-    private static volatile int lastDestroyedCount = 0;
-
-    private static final long SHOW_DURATION_MS = 2000L; // 2 seconds shown
-    private static final long FADE_DURATION_MS = 500L;  // 0.5 second fade
 
     @Override
     public void onInitializeClient() {
-        try { ConfigManager.load(); } catch (Throwable ignored) {}
+        // HUD 登録（存在すれば）
+        try {
+            OrePickerHud.register();
+        } catch (Throwable ignored) {}
 
+        // キーバインドをフィールドで持つ（ローカルにしない）
         holdKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.orepicker.hold",
                 InputUtil.Type.KEYSYM,
@@ -48,117 +43,319 @@ public class Ore_pickerClient implements ClientModInitializer {
                 "category.orepicker"
         ));
 
-        // S2C receiver: destroyed count
+        // ClientTickEvents 登録（reflection）
         try {
-            ClientPlayNetworking.registerGlobalReceiver(DESTROYED_ID, (client, handler, buf, responseSender) -> {
-                try {
-                    int cnt = buf.readInt();
-                    lastDestroyedCount = cnt;
-                    hudShowNow();
-                } catch (Throwable t) {
-                    t.printStackTrace();
-                }
-            });
+            registerClientTickListenerReflection();
         } catch (Throwable t) {
             t.printStackTrace();
         }
 
-        // tick: watch key changes and send PacketByteBuf to server
-        ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            try {
-                if (holdKey == null || MinecraftClient.getInstance().player == null) return;
-                boolean pressed = holdKey.isPressed();
-                String mode = ConfigManager.INSTANCE.mode == null ? "hold" : ConfigManager.INSTANCE.mode;
+        // DestroyedCount 受信登録（reflection）
+        try {
+            registerDestroyedCountReceiverReflection();
+        } catch (Throwable t) {
+            t.printStackTrace();
+        }
+    }
 
-                if ("toggle".equalsIgnoreCase(mode)) {
-                    if (pressed && !lastPressed) {
-                        clientToggleState = !clientToggleState;
-                        sendTogglePacket();
-                        hudShowNow();
-                    }
-                } else {
-                    if (pressed != lastPressed) {
-                        sendHoldPacket(pressed);
-                        hudShowNow();
+    // ---------------- ClientTick registration ----------------
+    private void registerClientTickListenerReflection() {
+        try {
+            Class<?> ccte = Class.forName("net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents");
+            java.lang.reflect.Field f = null;
+            try {
+                f = ccte.getField("END_CLIENT_TICK");
+            } catch (NoSuchFieldException nsf) {
+                for (java.lang.reflect.Field ff : ccte.getFields()) {
+                    if (ff.getName().toUpperCase().contains("END")) {
+                        f = ff;
+                        break;
                     }
                 }
-                lastPressed = pressed;
+            }
+            if (f == null) {
+                System.err.println("[OrePicker-Client] END_CLIENT_TICK field not found.");
+                return;
+            }
+
+            Object eventObj = f.get(null);
+            if (eventObj == null) {
+                System.err.println("[OrePicker-Client] END_CLIENT_TICK instance is null.");
+                return;
+            }
+
+            Method registerMethod = null;
+            Class<?> listenerType = null;
+            for (Method m : eventObj.getClass().getMethods()) {
+                if (!m.getName().equals("register")) continue;
+                if (m.getParameterCount() == 1) {
+                    registerMethod = m;
+                    listenerType = m.getParameterTypes()[0];
+                    break;
+                }
+            }
+            if (registerMethod == null || listenerType == null) {
+                System.err.println("[OrePicker-Client] register(listener) method not found on END_CLIENT_TICK");
+                return;
+            }
+
+            // InvocationHandler を static 内部クラスにしてローカルキャプチャを避ける
+            final ClientTickInvocationHandler handler = new ClientTickInvocationHandler(this);
+
+            Object proxy = Proxy.newProxyInstance(
+                    listenerType.getClassLoader(),
+                    new Class<?>[]{listenerType},
+                    handler
+            );
+
+            registerMethod.invoke(eventObj, proxy);
+            System.out.println("[OrePicker-Client] Registered client tick listener reflectively.");
+        } catch (ClassNotFoundException cnf) {
+            System.err.println("[OrePicker-Client] ClientTickEvents class not found: " + cnf.getMessage());
+        } catch (InvocationTargetException | IllegalAccessException e) {
+            e.printStackTrace();
+        } catch (Throwable t) {
+            t.printStackTrace();
+        }
+    }
+
+    // static にして外側のインスタンス参照のみ保持（final で安全）
+    private static class ClientTickInvocationHandler implements InvocationHandler {
+        private final Ore_pickerClient outer;
+
+        ClientTickInvocationHandler(Ore_pickerClient outer) {
+            this.outer = outer;
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) {
+            try {
+                MinecraftClient mcFromArgs = null;
+                if (args != null) {
+                    for (Object a : args) {
+                        if (a instanceof MinecraftClient) {
+                            mcFromArgs = (MinecraftClient) a;
+                            break;
+                        }
+                    }
+                }
+                final MinecraftClient mcFinal = (mcFromArgs != null) ? mcFromArgs : MinecraftClient.getInstance();
+                if (mcFinal == null) return null;
+
+                // anonymous Runnable から参照されるのは final な mcFinal（これで capture 問題回避）
+                mcFinal.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            outer.handleClientTick(mcFinal);
+                        } catch (Throwable t) {
+                            t.printStackTrace();
+                        }
+                    }
+                });
             } catch (Throwable t) {
                 t.printStackTrace();
             }
-        });
+            return null;
+        }
+    }
 
-        // HUD rendering
-        HudRenderCallback.EVENT.register((DrawContext drawContext, RenderTickCounter tickCounter) -> {
+    // 実際の tick ハンドリング（インスタンスメソッド）
+    private void handleClientTick(MinecraftClient client) {
+        try {
+            if (holdKey == null || client.player == null) return;
+            boolean pressed = holdKey.isPressed();
+            if (pressed != lastPressed) {
+                lastPressed = pressed;
+                boolean sent = trySendHoldViaReflection(pressed);
+                try {
+                    client.player.sendMessage(Text.of("Client: send hold=" + pressed + " -> " + (sent ? "SENT" : "NOT_SENT")), false);
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            t.printStackTrace();
+        }
+    }
+
+    // ---------------- DestroyedCount receiver registration ----------------
+    private void registerDestroyedCountReceiverReflection() {
+        try {
+            Class<?> cpnc;
             try {
-                MinecraftClient mc = MinecraftClient.getInstance();
-                if (mc == null || mc.player == null) return;
+                cpnc = Class.forName("net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking");
+            } catch (ClassNotFoundException e) {
+                cpnc = Class.forName("net.fabricmc.fabric.api.networking.v1.ClientPlayNetworking");
+            }
 
-                long now = System.currentTimeMillis();
-                if (!hudVisible) return;
+            Method target = null;
+            for (Method m : cpnc.getMethods()) {
+                if (!m.getName().equals("registerGlobalReceiver")) continue;
+                if (m.getParameterCount() != 2) continue;
+                target = m;
+                break;
+            }
 
-                long elapsedSinceShow = now - lastHudShownMs;
-                float alpha = 1.0f;
-                if (elapsedSinceShow <= SHOW_DURATION_MS) {
-                    alpha = 1.0f;
-                } else if (elapsedSinceShow <= SHOW_DURATION_MS + FADE_DURATION_MS) {
-                    float t = (float)(elapsedSinceShow - SHOW_DURATION_MS) / (float)FADE_DURATION_MS;
-                    alpha = 1.0f - t;
-                } else {
-                    hudVisible = false;
+            if (target == null) {
+                System.err.println("[OrePicker-Client] registerGlobalReceiver not found on ClientPlayNetworking");
+                return;
+            }
+
+            Class<?> handlerInterface = target.getParameterTypes()[1];
+
+            Object handlerProxy = Proxy.newProxyInstance(
+                    handlerInterface.getClassLoader(),
+                    new Class<?>[]{handlerInterface},
+                    new DestroyedCountInvocationHandler()
+            );
+
+            // 優先して TYPE を試す
+            try {
+                target.invoke(null, DestroyedCountS2CPayload.TYPE, handlerProxy);
+                System.out.println("[OrePicker-Client] registerGlobalReceiver(TYPE) invoked.");
+                return;
+            } catch (InvocationTargetException | IllegalAccessException e) {
+                // fallthrough
+            }
+
+            // 次に Identifier 版を試す
+            try {
+                Method idBased = null;
+                for (Method m : cpnc.getMethods()) {
+                    if (!m.getName().equals("registerGlobalReceiver")) continue;
+                    if (m.getParameterCount() == 2 && m.getParameterTypes()[0].getSimpleName().equals("Identifier")) {
+                        idBased = m;
+                        break;
+                    }
+                }
+                if (idBased != null) {
+                    idBased.invoke(null, DestroyedCountS2CPayload.ID, handlerProxy);
+                    System.out.println("[OrePicker-Client] registerGlobalReceiver(Identifier) invoked.");
                     return;
                 }
+            } catch (Throwable ignored) {}
 
-                int scaledW = mc.getWindow().getScaledWidth();
-                int scaledH = mc.getWindow().getScaledHeight();
-
-                String mode = ConfigManager.INSTANCE.mode == null ? "hold" : ConfigManager.INSTANCE.mode;
-                boolean active = "toggle".equalsIgnoreCase(mode) ? clientToggleState : (holdKey != null && holdKey.isPressed());
-
-                String text = "OrePicker: " + (active ? "ON" : "OFF") + " (" + lastDestroyedCount + ")";
-                int baseColor = active ? 0x66FF66 : 0xCCCCCC; // base rgb
-                int alphaByte = Math.max(0, Math.min(255, (int)(alpha * 255f)));
-                int color = (alphaByte << 24) | (baseColor & 0x00FFFFFF);
-
-                Text t = Text.of(text);
-                int width = mc.textRenderer.getWidth(t);
-
-                int x = scaledW / 2 - width / 2;
-                int y = scaledH - 70; // moved upward to avoid hotbar overlay
-
-                drawContext.drawTextWithShadow(mc.textRenderer, t, x, y, color);
-            } catch (Throwable t) {
-                t.printStackTrace();
-            }
-        });
-    }
-
-    private static void hudShowNow() {
-        hudVisible = true;
-        lastHudShownMs = System.currentTimeMillis();
-    }
-
-    private void sendHoldPacket(boolean pressed) {
-        try {
-            PacketByteBuf buf = new PacketByteBuf(Unpooled.buffer());
-            buf.writeBoolean(pressed);
-            ClientPlayNetworking.send(HOLD_ID, buf);
-            MinecraftClient.getInstance().player.sendMessage(Text.of("Client: send hold=" + pressed + " -> SENT"), false);
+            System.err.println("[OrePicker-Client] Could not register destroyed-count receiver reflectively.");
+        } catch (ClassNotFoundException cnf) {
+            System.err.println("[OrePicker-Client] ClientPlayNetworking class not found: " + cnf.getMessage());
         } catch (Throwable t) {
             t.printStackTrace();
-            try { MinecraftClient.getInstance().player.sendMessage(Text.of("Client: send hold=" + pressed + " -> NOT_SENT"), false); } catch (Throwable ignored) {}
         }
     }
 
-    private void sendTogglePacket() {
+    // static invocation handler — 匿名クラス内で使う変数はすべて final にして参照
+    private static class DestroyedCountInvocationHandler implements InvocationHandler {
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) {
+            try {
+                MinecraftClient mcFromArgs = null;
+                int count = -1;
+
+                if (args != null) {
+                    for (Object a : args) {
+                        if (a == null) continue;
+                        if (a instanceof MinecraftClient) {
+                            mcFromArgs = (MinecraftClient) a;
+                        } else if (a instanceof PacketByteBuf) {
+                            PacketByteBuf buf = (PacketByteBuf) a;
+                            try {
+                                count = buf.readVarInt();
+                            } catch (Throwable ex) {
+                                try { buf.readerIndex(0); } catch (Throwable ignore) {}
+                                try { count = buf.readInt(); } catch (Throwable ignore) {}
+                            }
+                        } else {
+                            try {
+                                Method mcount = a.getClass().getMethod("count");
+                                Object v = mcount.invoke(a);
+                                if (v instanceof Integer) count = (Integer) v;
+                            } catch (NoSuchMethodException ignored) {}
+                        }
+                    }
+                }
+
+                final MinecraftClient mcFinal = (mcFromArgs != null) ? mcFromArgs : MinecraftClient.getInstance();
+                final int cntFinal = count;
+                if (mcFinal != null && cntFinal >= 0) {
+                    mcFinal.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                if (mcFinal.player != null) mcFinal.player.sendMessage(Text.of("Destroyed: " + cntFinal), false);
+                                OrePickerHud.onDestroyedCount(cntFinal);
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+                }
+            } catch (Throwable t) {
+                t.printStackTrace();
+            }
+            return null;
+        }
+    }
+
+    // ---------------- send Hold -> server (reflection) ----------------
+    private boolean trySendHoldViaReflection(boolean pressed) {
         try {
-            PacketByteBuf buf = new PacketByteBuf(Unpooled.buffer());
-            buf.writeBoolean(true); // only pressed=true for toggle
-            ClientPlayNetworking.send(HOLD_ID, buf);
-            MinecraftClient.getInstance().player.sendMessage(Text.of("Client: send toggle -> SENT"), false);
+            Class<?> cpnc;
+            try {
+                cpnc = Class.forName("net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking");
+            } catch (ClassNotFoundException e) {
+                cpnc = Class.forName("net.fabricmc.fabric.api.networking.v1.ClientPlayNetworking");
+            }
+
+            boolean didSend = false;
+            HoldC2SPayload payload = new HoldC2SPayload(pressed);
+
+            for (Method m : cpnc.getMethods()) {
+                if (!m.getName().equals("send")) continue;
+                Class<?>[] pts = m.getParameterTypes();
+
+                if (pts.length == 1) {
+                    try {
+                        m.invoke(null, payload);
+                        didSend = true;
+                        break;
+                    } catch (IllegalArgumentException ia) {
+                        // incompatible
+                    }
+                }
+
+                if (pts.length == 2) {
+                    try {
+                        Object handler = null;
+                        try { handler = MinecraftClient.getInstance().getNetworkHandler(); } catch (Throwable ignore) { handler = null; }
+                        if (handler != null && pts[0].isAssignableFrom(handler.getClass())) {
+                            m.invoke(null, handler, payload);
+                            didSend = true;
+                            break;
+                        }
+                    } catch (IllegalArgumentException | InvocationTargetException | IllegalAccessException ignore) {}
+                }
+            }
+
+            if (!didSend) {
+                try {
+                    PacketByteBuf buf = new PacketByteBuf(Unpooled.buffer());
+                    buf.writeBoolean(pressed);
+                    for (Method m : cpnc.getMethods()) {
+                        if (!m.getName().equals("send")) continue;
+                        Class<?>[] pts = m.getParameterTypes();
+                        if (pts.length == 2 && pts[0].getSimpleName().equals("Identifier")
+                                && PacketByteBuf.class.isAssignableFrom(pts[1])) {
+                            m.invoke(null, HoldC2SPayload.ID, buf);
+                            didSend = true;
+                            break;
+                        }
+                    }
+                } catch (Throwable ignore) {}
+            }
+
+            return didSend;
+        } catch (ClassNotFoundException cnf) {
+            return false;
         } catch (Throwable t) {
             t.printStackTrace();
-            try { MinecraftClient.getInstance().player.sendMessage(Text.of("Client: send toggle -> NOT_SENT"), false); } catch (Throwable ignored) {}
+            return false;
         }
     }
 }
